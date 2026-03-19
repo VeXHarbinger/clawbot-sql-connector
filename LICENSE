@@ -1,0 +1,55 @@
+MIT License with No-Warranty Clause
+=====================================
+
+Copyright (c) 2026 VeX Harbinger / Oblio Systems
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+---
+
+SECURITY AND MAINTENANCE NOTICE
+================================
+
+This software is provided free of charge. While we strive to follow security
+best practices and modern development standards at the time of release, we
+make no guarantee that this code will be maintained, patched, or updated to
+address future vulnerabilities.
+
+By using this software, you acknowledge:
+
+1. NO SECURITY GUARANTEE — This code is provided as-is. Security practices
+   evolve; what is secure today may not be tomorrow. Review the code yourself
+   before deploying in any production or sensitive environment.
+
+2. NO MAINTENANCE COMMITMENT — Issues, pull requests, and vulnerability
+   reports are reviewed on a best-effort basis. There is no SLA, support
+   contract, or obligation to respond.
+
+3. USE AT YOUR OWN RISK — The authors accept no liability for data loss,
+   security breaches, downtime, or any other damages arising from the use
+   of this software in any context.
+
+4. BEST EFFORT STANDARDS — We do our best to write clean, secure, and
+   well-tested code. Dependencies are pinned where possible. However, we
+   cannot guarantee that third-party dependencies remain free of
+   vulnerabilities over time.
+
+If you find a security issue, please report it responsibly via the repository's
+issue tracker or directly to the maintainer. We appreciate the community's
+help in keeping open-source software safe.
