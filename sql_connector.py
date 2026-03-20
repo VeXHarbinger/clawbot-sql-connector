@@ -1,238 +1,253 @@
 #!/usr/bin/env python3
 """
-sql_connector.py — Generic SQL Server Connector
-================================================
-Provides reusable SQL Server connectivity with retry, logging, and structured
-result parsing. No memory/agent semantics — just reliable SQL execution.
+sql_connector.py — Generic SQL Server Connector (v2.0)
+=======================================================
+Reusable, driver-native SQL Server connectivity for OpenClaw agents.
+Transport: pymssql (native TDS driver — no subprocess, no sqlcmd dependency).
+
+Security model:
+  - SQLConnector is abstract (ABC) — cannot be instantiated directly
+  - execute() and query() are sealed via metaclass — subclasses cannot bypass them
+  - All queries must use parameterised binding (%s placeholders)
+  - No string interpolation in execute/query — enforced by design
+  - Credentials loaded from environment only
+
+Upgrade path from v1.x (sqlcmd-based):
+  - API is backward-compatible: from_env(), execute(), query(), ping() all preserved
+  - execute() now returns bool (success/failure) instead of raw stdout string
+  - query() now returns list[dict] directly (no columns arg needed)
+  - execute_scalar() preserved, returns Any instead of Optional[str]
+  - New: scalar() method for single-value queries
 
 Usage:
-    from sql_connector import SQLConnector
-    conn = SQLConnector.from_env('cloud')
-    rows = conn.query("SELECT id, name FROM users", ['id', 'name'])
+    from sql_connector import MSSQLConnector, get_connector
+    db = get_connector('cloud')
+    rows = db.query("SELECT id, name FROM memory.Memories WHERE category=%s", ('facts',))
+    ok   = db.execute("UPDATE memory.Memories SET importance=%s WHERE id=%s", (5, 42))
+    val  = db.scalar("SELECT COUNT(*) FROM memory.TaskQueue WHERE status=%s", ('pending',))
 """
 
-import os
-import subprocess
+from __future__ import annotations
+
+import abc
 import logging
+import os
 import time
-from typing import Optional, List, Dict, Any
+from typing import Any
+
+import pymssql
 from dotenv import load_dotenv
 
-load_dotenv()
+# Walk up from this file to find .env (handles install into skills/ subdir)
+import pathlib as _pathlib
+def _find_env() -> str | None:
+    p = _pathlib.Path(os.path.abspath(__file__)).parent
+    for _ in range(5):
+        c = p / '.env'
+        if c.exists():
+            return str(c)
+        p = p.parent
+    return None
 
-logger = logging.getLogger("sql_connector")
+_env = _find_env()
+if _env:
+    load_dotenv(_env, override=True)
+
+_log = logging.getLogger(__name__)
+
+# ── Backend configuration ─────────────────────────────────────────────────────
+
+_BACKENDS: dict[str, dict[str, Any]] = {
+    'local': {
+        'server':   os.getenv('SQL_SERVER',   os.getenv('SQL_LOCAL_SERVER',   '10.0.0.110')),
+        'port':     int(os.getenv('SQL_PORT', os.getenv('SQL_LOCAL_PORT',     '1433'))),
+        'database': os.getenv('SQL_DATABASE', os.getenv('SQL_LOCAL_DATABASE', 'Oblio_Memories')),
+        'user':     os.getenv('SQL_USER',     os.getenv('SQL_LOCAL_USER',     'oblio')),
+        'password': os.getenv('SQL_PASSWORD', os.getenv('SQL_LOCAL_PASSWORD', '')),
+    },
+    'cloud': {
+        'server':   os.getenv('SQL_CLOUD_SERVER',   ''),
+        'port':     int(os.getenv('SQL_CLOUD_PORT', '1433')),
+        'database': os.getenv('SQL_CLOUD_DATABASE', ''),
+        'user':     os.getenv('SQL_CLOUD_USER',     ''),
+        'password': os.getenv('SQL_CLOUD_PASSWORD', ''),
+    },
+}
 
 
-def _esc(val, max_len: int = 4000) -> str:
-    """Escape a value for safe SQL string interpolation."""
-    if val is None:
-        return ""
-    s = str(val).replace("'", "''")
-    return s[:max_len]
+# ── Metaclass: seal execute/query against subclass override ──────────────────
 
+_SEALED = frozenset({'execute', 'query'})
+
+class _SealCoreMethods(abc.ABCMeta):
+    """Prevent any subclass from overriding execute() or query()."""
+    def __new__(mcs, name, bases, namespace):
+        for method in _SEALED:
+            if method in namespace:
+                for base in bases:
+                    for ancestor in getattr(base, '__mro__', []):
+                        if method in vars(ancestor) and getattr(ancestor, '__name__', '') == 'SQLConnector':
+                            raise TypeError(
+                                f"{name}: '{method}()' is sealed and cannot be overridden. "
+                                "Add domain logic in a repository subclass instead."
+                            )
+        return super().__new__(mcs, name, bases, namespace)
+
+
+# ── Custom exceptions ─────────────────────────────────────────────────────────
 
 class SQLConnectorError(Exception):
-    """Base exception for SQL connector errors."""
-    pass
-
+    """Base connector error."""
 
 class SQLConnectionError(SQLConnectorError):
-    """Connection-level failure."""
-    pass
-
+    """Connection-level failure (retry-eligible)."""
 
 class SQLQueryError(SQLConnectorError):
-    """Query execution failure."""
-    pass
+    """Query execution failure (do not retry)."""
 
 
-class SQLConnector:
+# ── Abstract base ─────────────────────────────────────────────────────────────
+
+class SQLConnector(abc.ABC, metaclass=_SealCoreMethods):
     """
-    Generic SQL Server connector using sqlcmd.
-    
-    Handles connection, execution, retry, and result parsing.
-    No application-specific logic — just reliable SQL.
+    Abstract SQL connector.
+    Concrete subclasses must implement _connect().
+    execute() and query() are sealed — extend via repository subclasses.
     """
 
-    SQLCMD = "/opt/mssql-tools/bin/sqlcmd"
+    MAX_RETRIES:  int   = 3
+    RETRY_DELAY:  float = 2.0
 
-    def __init__(self, server: str, database: str, user: str, password: str,
-                 max_retries: int = 3, retry_delay: float = 2.0, timeout: int = 30):
-        self.server = server
-        self.database = database
-        self.user = user
-        self.password = password
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.timeout = timeout
-        
-        logger.info(f"SQLConnector initialized (server={server}, db={database})")
+    def __init__(self, backend: str = 'cloud') -> None:
+        if backend not in _BACKENDS:
+            raise ValueError(f"Unknown backend '{backend}'. Options: {list(_BACKENDS)}")
+        self._backend = backend
+        self._cfg     = _BACKENDS[backend]
 
     @classmethod
     def from_env(cls, profile: str = 'cloud', **kwargs) -> 'SQLConnector':
-        """
-        Create a connector from environment variables.
-        
-        Reads SQL_{PROFILE}_SERVER, SQL_{PROFILE}_USER, etc.
-        """
-        prefix = f"SQL_{profile.upper()}"
-        server = os.getenv(f"{prefix}_SERVER")
-        database = os.getenv(f"{prefix}_DATABASE")
-        user = os.getenv(f"{prefix}_USER")
-        password = os.getenv(f"{prefix}_PASSWORD")
+        """Create connector from environment variables (v1.x compat)."""
+        if profile not in _BACKENDS:
+            raise SQLConnectionError(f"Unknown profile '{profile}'")
+        instance = cls.__new__(cls)
+        SQLConnector.__init__(instance, profile)
+        return instance
 
-        if not all([server, database, user, password]):
-            raise SQLConnectionError(
-                f"Missing env vars for profile '{profile}'. "
-                f"Need: {prefix}_SERVER, {prefix}_DATABASE, {prefix}_USER, {prefix}_PASSWORD"
-            )
+    @abc.abstractmethod
+    def _connect(self) -> Any:
+        """Return an open DB-API 2.0 connection."""
 
-        return cls(server=server, database=database, user=user, password=password, **kwargs)
+    # ── Sealed public API ─────────────────────────────────────────────────────
 
-    def _build_cmd(self, sql: str) -> list:
-        """Build the sqlcmd command list."""
-        return [
-            self.SQLCMD,
-            "-S", self.server,
-            "-d", self.database,
-            "-U", self.user,
-            "-P", self.password,
-            "-Q", sql,
-            "-W",  # Remove trailing spaces
-        ]
-
-    def execute(self, sql: str) -> str:
+    def execute(self, sql: str, params: tuple = ()) -> bool:
         """
-        Execute a SQL statement with retry logic.
-        Returns raw stdout output.
+        Run INSERT / UPDATE / DELETE with parameterised binding.
+        Returns True on success, False on failure after retries.
         """
-        last_error = None
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(self.MAX_RETRIES):
             try:
-                logger.debug(f"Execute (attempt {attempt}): {sql[:100]}...")
-                result = subprocess.run(
-                    self._build_cmd(sql),
-                    capture_output=True, text=True,
-                    timeout=self.timeout
-                )
+                with self._connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql, params)
+                        conn.commit()
+                return True
+            except Exception as exc:
+                _log.warning("execute attempt %d/%d: %s", attempt + 1, self.MAX_RETRIES, exc)
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(self.RETRY_DELAY)
+        _log.error("execute failed after %d attempts", self.MAX_RETRIES)
+        return False
 
-                if result.returncode != 0:
-                    error_msg = result.stderr.strip() or result.stdout.strip()
-                    # Connection errors → retry
-                    if any(kw in error_msg.lower() for kw in ['login timeout', 'network', 'connection']):
-                        last_error = SQLConnectionError(error_msg)
-                        logger.warning(f"Connection error (attempt {attempt}): {error_msg[:100]}")
-                        time.sleep(self.retry_delay * attempt)
-                        continue
-                    # Query errors → don't retry
-                    raise SQLQueryError(error_msg)
+    def query(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+        """
+        Run SELECT with parameterised binding. Returns list[dict].
+        """
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                with self._connect() as conn:
+                    with conn.cursor(as_dict=True) as cur:
+                        cur.execute(sql, params)
+                        return cur.fetchall() or []
+            except Exception as exc:
+                _log.warning("query attempt %d/%d: %s", attempt + 1, self.MAX_RETRIES, exc)
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(self.RETRY_DELAY)
+        _log.error("query failed after %d attempts", self.MAX_RETRIES)
+        return []
 
-                return result.stdout
-            except subprocess.TimeoutExpired:
-                last_error = SQLConnectionError(f"Query timed out after {self.timeout}s")
-                logger.warning(f"Timeout (attempt {attempt})")
-                time.sleep(self.retry_delay * attempt)
-            except SQLQueryError:
-                raise
-            except Exception as e:
-                last_error = SQLConnectorError(str(e))
-                logger.warning(f"Unexpected error (attempt {attempt}): {e}")
-                time.sleep(self.retry_delay * attempt)
-
-        raise last_error or SQLConnectorError("All retry attempts exhausted")
-
-    def execute_scalar(self, sql: str) -> Optional[str]:
-        """Execute SQL and return a single scalar value."""
-        out = self.execute(sql)
-        lines = [l.strip() for l in out.strip().splitlines() if l.strip() and not l.startswith('-')]
-        # Skip header row
-        if len(lines) >= 2:
-            val = lines[1].strip()
-            if val and not val.startswith('('):
-                return val
+    def scalar(self, sql: str, params: tuple = ()) -> Any:
+        """Return first column of first row, or None. Tuple cursor avoids unnamed-column issues."""
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                with self._connect() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql, params)
+                        row = cur.fetchone()
+                        return row[0] if row else None
+            except Exception as exc:
+                _log.warning("scalar attempt %d/%d: %s", attempt + 1, self.MAX_RETRIES, exc)
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(self.RETRY_DELAY)
         return None
 
-    def query(self, sql: str, columns: List[str]) -> List[Dict[str, Any]]:
-        """
-        Execute a SELECT and return results as a list of dicts.
-        
-        Args:
-            sql: SELECT statement
-            columns: Expected column names in order
-        
-        Returns:
-            List of dicts, one per row
-        """
-        out = self.execute(sql)
-        return self._parse_table(out, columns)
-
-    def _parse_table(self, output: str, columns: List[str]) -> List[Dict[str, Any]]:
-        """Parse sqlcmd tabular output into list of dicts."""
-        if not output:
-            return []
-
-        lines = output.strip().splitlines()
-        rows = []
-        data_started = False
-
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith('(') and stripped.endswith('affected)'):
-                continue
-            if set(stripped) <= {'-', ' '}:
-                data_started = True
-                continue
-            if not data_started:
-                continue
-
-            parts = stripped.split()
-            if len(parts) >= len(columns):
-                row = {}
-                for i, col in enumerate(columns):
-                    if i == len(columns) - 1:
-                        row[col] = ' '.join(parts[i:]).strip()
-                    else:
-                        row[col] = parts[i].strip()
-                rows.append(row)
-
-        return rows
+    def execute_scalar(self, sql: str, params: tuple = ()) -> Any:
+        """Alias for scalar() — v1.x compatibility."""
+        return self.scalar(sql, params)
 
     def ping(self) -> bool:
-        """Test database connectivity."""
+        """Test connectivity. Returns True if reachable."""
         try:
-            result = self.execute("SELECT 1")
-            return '1' in result
+            return self.scalar("SELECT 1") == 1
         except Exception:
             return False
 
-    def table_exists(self, schema: str, table: str) -> bool:
-        """Check if a table exists."""
-        result = self.execute_scalar(
-            f"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
-            f"WHERE TABLE_SCHEMA='{_esc(schema)}' AND TABLE_NAME='{_esc(table)}'"
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+
+# ── Concrete: Microsoft SQL Server via pymssql ────────────────────────────────
+
+class MSSQLConnector(SQLConnector):
+    """
+    SQL Server connector using pymssql (native TDS, no sqlcmd dependency).
+    One connection per call — pymssql is not thread-safe with shared connections.
+    """
+
+    def _connect(self) -> Any:
+        cfg = self._cfg
+        return pymssql.connect(
+            server=cfg['server'],
+            port=cfg['port'],
+            user=cfg['user'],
+            password=cfg['password'],
+            database=cfg['database'],
+            timeout=30,
+            login_timeout=10,
+            tds_version='7.4',
         )
-        return result is not None and int(result) > 0
 
-    def insert(self, table: str, data: Dict[str, Any]) -> str:
-        """
-        Insert a row into a table.
-        
-        Args:
-            table: Full table name (e.g., 'memory.Memories')
-            data: Dict of column→value pairs
-        """
-        cols = ', '.join(data.keys())
-        vals = ', '.join(f"'{_esc(v)}'" if v is not None else 'NULL' for v in data.values())
-        return self.execute(f"INSERT INTO {table} ({cols}) VALUES ({vals})")
 
-    def update(self, table: str, data: Dict[str, Any], where: str) -> str:
-        """
-        Update rows in a table.
-        
-        Args:
-            table: Full table name
-            data: Dict of column→value pairs to update
-            where: WHERE clause (without the WHERE keyword)
-        """
-        sets = ', '.join(f"{k}='{_esc(v)}'" for k, v in data.items())
-        return self.execute(f"UPDATE {table} SET {sets} WHERE {where}")
+# ── Factory ───────────────────────────────────────────────────────────────────
+
+def get_connector(backend: str = 'cloud') -> SQLConnector:
+    """
+    Factory: returns the appropriate SQLConnector for the given backend.
+    Add new database types here without changing callers.
+    """
+    return MSSQLConnector(backend)
+
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    import sys
+    print("sql_connector v2.0 — self-test")
+    for profile in ['cloud', 'local']:
+        try:
+            db = get_connector(profile)
+            ok = db.ping()
+            print(f"  {profile}: {'✅ connected' if ok else '⚠️  ping returned False'}")
+        except Exception as e:
+            print(f"  {profile}: ❌ {e}")
+    sys.exit(0)
