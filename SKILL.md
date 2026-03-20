@@ -1,63 +1,63 @@
+---
+name: sql-connector
+description: "Generic SQL Server connectivity for OpenClaw agents. Use when: (1) executing parameterized queries against SQL Server, (2) building repository layers that need a sealed, retry-capable SQL transport, (3) any agent that needs reliable MSSQL access without subprocess/sqlcmd. Provides execute/query/scalar APIs via pymssql with automatic retry, connection pooling, and structured error handling."
+---
+
 # SQL Connector Skill
-> Generic SQL Server connectivity for OpenClaw agents
+> Generic SQL Server connectivity for OpenClaw agents — pymssql transport
 
 ## Overview
-Provides a reusable, battle-tested SQL Server connection layer with automatic retry, connection pooling, parameterized queries, and structured error handling. Built for MSSQL (via `sqlcmd`) with plans for ODBC/pyodbc support.
+
+Provides a reusable, sealed SQL Server connection layer with automatic retry, parameterized queries, and structured error handling. Built on **pymssql** (native TDS driver — no sqlcmd required).
 
 ## Installation
+
 ```bash
 clawhub install sql-connector
 ```
 
-## Usage
+## Quick Start
 
-### Quick Start
 ```python
-from sql_connector import SQLConnector
+from sql_connector import get_connector
 
-# From environment variables
-conn = SQLConnector.from_env('cloud')  # reads SQL_CLOUD_SERVER, etc.
+db = get_connector('cloud')   # or 'local'
 
-# Direct
-conn = SQLConnector(server='myserver.com', database='mydb', user='sa', password='secret')
+# Execute (INSERT/UPDATE/DELETE)
+ok = db.execute("INSERT INTO memory.Logs (msg) VALUES (%s)", ("hello",))
 
-# Execute queries
-result = conn.execute("SELECT COUNT(*) FROM users")
-scalar = conn.execute_scalar("SELECT MAX(id) FROM orders")
-rows = conn.query("SELECT id, name FROM products WHERE active=1")
+# Query (SELECT → list of dicts)
+rows = db.query("SELECT id, name FROM memory.Memories WHERE category=%s", ("facts",))
+
+# Scalar (single value)
+count = db.scalar("SELECT COUNT(*) FROM memory.TaskQueue WHERE status='pending'")
 ```
 
-### Features
-- **Auto-retry** with exponential backoff (configurable)
-- **Connection validation** via `ping()`
-- **Parameterized queries** to prevent SQL injection
-- **Structured result parsing** — rows returned as list of dicts
-- **Logging** — all queries logged at DEBUG level
-- **Error classification** — distinguishes connection vs. query errors
+## Environment Variables
 
-### Configuration
-Environment variables follow the pattern `SQL_{PROFILE}_*`:
 ```
 SQL_CLOUD_SERVER=sql5112.site4now.net
 SQL_CLOUD_DATABASE=db_99ba1f_memory4oblio
-SQL_CLOUD_USER=myuser
-SQL_CLOUD_PASSWORD=mypassword
+SQL_CLOUD_USER=...
+SQL_CLOUD_PASSWORD=...
+
+SQL_LOCAL_SERVER=10.0.0.110
+SQL_LOCAL_DATABASE=Oblio_Memories
+SQL_LOCAL_USER=sa
+SQL_LOCAL_PASSWORD=...
 ```
 
-### API Reference
+## Architecture
 
-| Method | Description |
-|--------|-------------|
-| `execute(sql)` | Execute SQL, return raw output |
-| `execute_scalar(sql)` | Execute SQL, return single value |
-| `query(sql, columns)` | Execute SELECT, return list of dicts |
-| `ping()` | Test connection, return bool |
-| `from_env(profile)` | Create from env vars |
+```
+SQLConnector (ABC, _LockCoreMethods metaclass)
+  execute() / query() / scalar()  ← SEALED — parameterized only, no override
+  MSSQLConnector (pymssql, TDS 7.4)
+    └── get_connector(backend) factory
+```
 
-## Requirements
-- `sqlcmd` (mssql-tools) installed and in PATH
-- Python 3.8+
-- `.env` file with SQL credentials
+`execute()` and `query()` are sealed by metaclass — subclasses cannot override them, enforcing parameterized-only access.
 
 ## License
+
 MIT
