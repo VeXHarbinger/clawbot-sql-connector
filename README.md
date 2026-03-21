@@ -1,76 +1,103 @@
 # clawbot-sql-connector
 
-A lightweight Python library for SQL Server connectivity in OpenClaw / Oblio agent systems. Handles connection pooling, retry logic, and environment-based credential management.
+> ⚠️ **ALPHA — Use at your own risk.** API is functional and tested but may change. We're actively using this in production and will stabilize the API after 30 days of community feedback. Please open issues for anything that breaks.
 
-> ⚠️ **Work in Progress** — API may change. Use in production at your own discretion.
+A sealed, retry-capable SQL Server connector for OpenClaw agents. Built on **pymssql** — no `sqlcmd` or `mssql-tools` required.
 
 ## Features
 
-- Environment-based credentials (never hardcoded)
-- Automatic retry with backoff on transient failures
-- `sqlcmd` subprocess wrapper for raw SQL execution
-- Compatible with `pyodbc` and `mssql-tools`
-- Designed for use with `clawbot-sql-memory`
+- `get_connector('cloud')` / `get_connector('local')` factory
+- Abstract base (`SQLConnector`) with `_LockCoreMethods` metaclass — `execute()` and `query()` cannot be overridden in subclasses, keeping all queries parameterized
+- Automatic retry with exponential backoff on transient failures
+- `execute()` — INSERT/UPDATE/DELETE, returns bool
+- `query()` — SELECT, returns list of dicts
+- `scalar()` — single value (e.g. `INSERTED.id`)
+- `ping()` — connectivity check
+- Environment-based credentials via `.env` — nothing hardcoded
+
+## Requirements
+
+```bash
+pip install pymssql python-dotenv
+```
+
+> **Note:** `pymssql` bundles its own TDS driver. No `sqlcmd`, no ODBC drivers, no `mssql-tools` needed.
 
 ## Installation
 
 ```bash
-pip install pyodbc python-dotenv
-# Also requires mssql-tools (sqlcmd)
-curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -
-apt-get install mssql-tools
-```
-
-## Quick Start
-
-```python
-from sql_connector import SQLConnector
-
-conn = SQLConnector()  # reads from .env
-result = conn.execute("SELECT TOP 5 * FROM memory.Memories")
-print(result)
+clawhub install sql-connector
 ```
 
 ## .env Setup
 
 ```env
-SQL_SERVER=your-server.database.windows.net
+# Local instance
+SQL_SERVER=10.0.0.110
 SQL_PORT=1433
-SQL_DATABASE=your_database
-SQL_USER=your_admin_user
+SQL_DATABASE=YourDatabase
+SQL_USER=your_user
 SQL_PASSWORD=your_password
 
-# Cloud instance (optional)
-SQL_CLOUD_SERVER=SQL5112.site4now.net
-SQL_CLOUD_DATABASE=db_99ba1f_memory4oblio
-SQL_CLOUD_USER=db_99ba1f_memory4oblio_admin
+# Cloud instance (Azure / site4now / etc.)
+SQL_CLOUD_SERVER=yourserver.database.windows.net
+SQL_CLOUD_PORT=1433
+SQL_CLOUD_DATABASE=your_cloud_db
+SQL_CLOUD_USER=your_cloud_user
 SQL_CLOUD_PASSWORD=your_cloud_password
 ```
 
-## API
+## Quick Start
 
-### `SQLConnector(profile='local')`
-Initialize with `'local'` or `'cloud'` profile.
+```python
+from sql_connector import get_connector
 
-### `.execute(query: str, timeout: int = 30) -> str`
-Run a SQL query. Returns raw `sqlcmd` output as a string.
+db = get_connector('cloud')   # or 'local'
 
-### `.ping() -> bool`
-Check connectivity. Returns `True` if the server is reachable.
+# INSERT / UPDATE / DELETE
+ok = db.execute(
+    "INSERT INTO memory.Logs (category, msg) VALUES (%s, %s)",
+    ("info", "hello world")
+)
 
-### `.remember(category, key, content, importance=3, tags='') -> int`
-Store a memory entry in `memory.Memories`. Returns the new row id.
+# SELECT → list of dicts
+rows = db.query(
+    "SELECT id, content FROM memory.Memories WHERE category = %s",
+    ("facts",)
+)
 
-### `.recall(category, key) -> str | None`
-Retrieve the most recent active memory entry by category and key.
+# Single value
+count = db.scalar("SELECT COUNT(*) FROM memory.TaskQueue WHERE status = %s", ("pending",))
 
-## Error Handling
+# Connectivity check
+if db.ping():
+    print("connected")
+```
 
-All methods retry up to 3 times with exponential backoff on connection errors. SQL errors are logged to `infrastructure/logs/sql_dbo.log`.
+## Architecture
 
-## Integration with clawbot-sql-memory
+```
+SQLConnector (ABC, _LockCoreMethods metaclass)
+  ├── execute() / query() / scalar()   ← SEALED — parameterized only, no overrides
+  ├── ping()
+  ├── _connect()                        ← abstract
+  └── MSSQLConnector (pymssql)          ← concrete implementation
+```
 
-This connector is the low-level transport layer. For higher-level semantic memory operations, use [clawbot-sql-memory](https://github.com/VeXHarbinger/clawbot-sql-memory).
+Extend by subclassing `MSSQLConnector` to add domain-specific repository methods. See [clawbot-sql-memory](https://github.com/VeXHarbinger/clawbot-sql-memory) for an example.
+
+## Security Note
+
+All queries are parameterized. The metaclass seals `execute()` and `query()` so subclasses cannot bypass parameterization. Never pass user input via f-strings or string concatenation into SQL — the connector will not prevent it at the call site if you build your query string before passing it in.
+
+## Related
+
+- [clawbot-sql-memory](https://github.com/VeXHarbinger/clawbot-sql-memory) — Semantic memory layer built on this connector
+- [oblio-heart-and-soul](https://github.com/VeXHarbinger/oblio-heart-and-soul) — Full agent system reference implementation
+
+## Community
+
+Found a bug? Have an improvement? Open an issue — this is alpha and community feedback shapes the v1 API.
 
 ## License
 
