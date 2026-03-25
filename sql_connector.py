@@ -33,31 +33,54 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 _log = logging.getLogger(__name__)
 
-# ── Backend configuration ────────────────────────────────────────────────────
+# ── Backend configuration (loaded from .env) ────────────────────────────────
+# Convention: SQL_<BACKEND>_SERVER, SQL_<BACKEND>_DATABASE, SQL_<BACKEND>_USER, SQL_<BACKEND>_PASSWORD
+# Example .env:
+#   SQL_local_server=10.0.0.110
+#   SQL_local_database=Oblio_Memories
+#   SQL_local_user=oblio
+#   SQL_local_password=secret123
+#
+#   SQL_cloud_server=SQL5112.site4now.net
+#   SQL_cloud_database=db_99ba1f_memory4oblio
+#   SQL_cloud_user=admin
+#   SQL_cloud_password=secret456
+#
+#   SQL_tat_server=SQL8011.site4now.net
+#   SQL_tat_database=db_99ba1f_tripatouriumdevdb
+#   SQL_tat_user=tat_admin
+#   SQL_tat_password=secret789
+#
+# To add a new backend: just add 4 vars to .env, then get_connector('newname') works
 
-_BACKENDS: dict[str, dict[str, Any]] = {
-    'local': {
-        'server':   os.getenv('SQL_LOCAL_SERVER',   '10.0.0.110'),
-        'port':     int(os.getenv('SQL_LOCAL_PORT', '1433')),
-        'database': os.getenv('SQL_LOCAL_DATABASE', 'Oblio_Memories'),
-        'user':     os.getenv('SQL_LOCAL_USER',     ''),
-        'password': os.getenv('SQL_LOCAL_PASSWORD', ''),
-    },
-    'cloud': {
-        'server':   os.getenv('SQL_CLOUD_SERVER',   ''),
-        'port':     int(os.getenv('SQL_CLOUD_PORT', '1433')),
-        'database': os.getenv('SQL_CLOUD_DATABASE', ''),
-        'user':     os.getenv('SQL_CLOUD_USER',     ''),
-        'password': os.getenv('SQL_CLOUD_PASSWORD', ''),
-    },
-    'tat': {
-        'server':   os.getenv('TAT_SQL_SERVER',   'SQL8011.site4now.net'),
-        'port':     int(os.getenv('TAT_SQL_PORT', '1433')),
-        'database': os.getenv('TAT_SQL_DATABASE', 'db_99ba1f_tripatouriumdevdb'),
-        'user':     os.getenv('TAT_SQL_USER',     ''),
-        'password': os.getenv('TAT_SQL_PASSWORD', ''),
-    },
-}
+def _load_backend_config(backend_name: str) -> dict[str, Any]:
+    """
+    Load backend config from .env using convention.
+    Pattern: SQL_<backend>_server, SQL_<backend>_database, SQL_<backend>_user, SQL_<backend>_password
+    """
+    prefix = f'SQL_{backend_name}_'
+    return {
+        'server':   os.getenv(f'{prefix}server',   ''),
+        'port':     int(os.getenv(f'{prefix}port', '1433')),
+        'database': os.getenv(f'{prefix}database', ''),
+        'user':     os.getenv(f'{prefix}user',     ''),
+        'password': os.getenv(f'{prefix}password', ''),
+    }
+
+
+_BACKENDS_CACHE: dict[str, dict[str, Any]] = {}
+
+def get_backend_config(backend: str) -> dict[str, Any]:
+    """Get backend config, cached after first load."""
+    if backend not in _BACKENDS_CACHE:
+        cfg = _load_backend_config(backend)
+        if not cfg.get('server') or not cfg.get('database'):
+            raise ValueError(
+                f"Backend '{backend}' not configured. "
+                f"Add SQL_{backend}_server and SQL_{backend}_database to .env"
+            )
+        _BACKENDS_CACHE[backend] = cfg
+    return _BACKENDS_CACHE[backend]
 
 # ── Locked-method sentinel ────────────────────────────────────────────────────
 
@@ -95,10 +118,11 @@ class SQLConnector(abc.ABC, metaclass=_LockCoreMethods):
     _consecutive_errors: int = 0
 
     def __init__(self, backend: str = 'cloud') -> None:
-        if backend not in _BACKENDS:
-            raise ValueError(f"Unknown backend '{backend}'. Choose: {list(_BACKENDS)}")
         self._backend = backend
-        self._cfg = _BACKENDS[backend]
+        try:
+            self._cfg = get_backend_config(backend)
+        except ValueError as e:
+            raise ValueError(f"Invalid backend '{backend}': {e}") from e
 
     # ── Must implement ────────────────────────────────────────────────────────
 
