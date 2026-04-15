@@ -118,14 +118,14 @@ class SQLConnector(abc.ABC, metaclass=_SealCoreMethods):
     MAX_RETRIES:  int   = 3
     RETRY_DELAY:  float = 2.0
 
-    def __init__(self, backend: str = 'cloud') -> None:
+    def __init__(self, backend: str = 'local') -> None:
         if backend not in _BACKENDS:
             raise ValueError(f"Unknown backend '{backend}'. Options: {list(_BACKENDS)}")
         self._backend = backend
         self._cfg     = _BACKENDS[backend]
 
     @classmethod
-    def from_env(cls, profile: str = 'cloud', **kwargs) -> 'SQLConnector':
+    def from_env(cls, profile: str = 'local', **kwargs) -> 'SQLConnector':
         """Create connector from environment variables (v1.x compat)."""
         if profile not in _BACKENDS:
             raise SQLConnectionError(f"Unknown profile '{profile}'")
@@ -230,7 +230,7 @@ class MSSQLConnector(SQLConnector):
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
-def get_connector(backend: str = 'cloud') -> SQLConnector:
+def get_connector(backend: str = 'local') -> SQLConnector:
     """
     Factory: returns the appropriate SQLConnector for the given backend.
     Add new database types here without changing callers.
